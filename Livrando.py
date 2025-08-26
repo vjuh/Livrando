@@ -37,7 +37,7 @@ Autor: ChatGPT (GPT-5 Thinking)
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import requests
 import re
 import csv
@@ -54,12 +54,69 @@ from PIL import Image
 from io import BytesIO
 from ebooklib import epub
 from PyPDF2 import PdfReader
+import PyPDF2._utils # Configurar PyPDF2 para ser mais tolerante
+PyPDF2._utils.DEBUG = False  # Desativar logs debug do PyPDF2
+import PyPDF2._reader # Configurar para ignorar alguns erros de PDF
+PyPDF2._reader.STRICT = False  # Modo não-estrito
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, List, Tuple
 import configparser
 import socket
 import traceback
 from datetime import datetime
+import sqlite3
+
+# Cache de metadados
+CACHE_DB = "livrando_cache.db"
+# Lista global de autores conhecidos para reutilização
+KNOWN_AUTHORS = [
+    'stephen king', 'agatha christie', 'j.k. rowling', 'paulo coelho', 
+    'dan brown', 'george r.r. martin', 'j.r.r. tolkien', 'rick riordan',
+    'Alexandra Sellers'
+]
+
+def init_cache():
+    """Inicializa o banco de cache"""
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS cache
+                 (query TEXT PRIMARY KEY, 
+                  data TEXT,
+                  created TIMESTAMP,
+                  accessed TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+def get_cached_data(query):
+    """Obtém dados do cache"""
+    try:
+        conn = sqlite3.connect(CACHE_DB)
+        c = conn.cursor()
+        c.execute("SELECT data FROM cache WHERE query = ?", (query,))
+        result = c.fetchone()
+        if result:
+            # Atualizar timestamp de acesso
+            c.execute("UPDATE cache SET accessed = ? WHERE query = ?", 
+                     (datetime.now(), query))
+            conn.commit()
+            return json.loads(result[0])
+    except:
+        pass
+    return None
+
+def set_cached_data(query, data):
+    """Armazena dados no cache"""
+    try:
+        conn = sqlite3.connect(CACHE_DB)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?)",
+                 (query, json.dumps(data), datetime.now(), datetime.now()))
+        conn.commit()
+    except:
+        pass
+
+# Inicializar cache na inicialização do app
+init_cache()
 
 # Configuração
 CONFIG_FILE = "livrando_config.ini"
@@ -86,7 +143,7 @@ except Exception:
     HAS_PDF = False
 
 # Formatos suportados expandidos
-SUPPORTED_EXTS = {'.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.fb2', '.txt', '.doc', '.docx', '.rtf', '.zip', '.rar', '.7z'}
+SUPPORTED_EXTS = {'.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.fb2', '.txt', '.doc', '.docx', '.rtf', '.zip', '.rar', '.7z', '.exe'}
 
 # Configurações padrão
 DEFAULT_CONFIG = {
@@ -94,6 +151,7 @@ DEFAULT_CONFIG = {
         'log_dirname': '1. logs',
         'unknown_dirname': '2. Não Localizados',
         'duplicates_dirname': '3. Duplicados',
+        'deleted_dirname': '4. Excluidos',  # NOVO
         'covers_dirname': 'covers',
         'organize_mode': 'autor',
         'filename_pattern': '{author} - {title} ({year})',
@@ -148,6 +206,58 @@ def get_config_value(config, section, key, default=None):
     except (configparser.NoSectionError, configparser.NoOptionError):
         return default
 
+
+import time
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+# Configurar retry automático
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+
+def buscar_com_rate_limit(titulo, autor, api_key=None):
+    """Busca com controle de rate limiting"""
+    # Esperar entre requests para evitar limite
+    time.sleep(0.5)  # 500ms entre requests
+    
+    try:
+        return buscar_google_books(titulo, autor, api_key)
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            print("Rate limit atingido, aguardando...")
+            time.sleep(2)  # Esperar mais se atingiu limite
+            return None
+        raise
+        
+def show_api_stats(self):
+    """Mostra estatísticas de uso das APIs"""
+    try:
+        conn = sqlite3.connect(CACHE_DB)
+        c = conn.cursor()
+        
+        # Contar requests por fonte
+        c.execute("SELECT COUNT(*) FROM cache WHERE data LIKE '%Google Books%'")
+        google_count = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM cache WHERE data LIKE '%Open Library%'")
+        ol_count = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM cache WHERE data LIKE '%ISBNdb%'")
+        isbndb_count = c.fetchone()[0]
+        
+        self.log_line(f"=== ESTATÍSTICAS API ===", "info")
+        self.log_line(f"Google Books: {google_count} requests", "info")
+        self.log_line(f"Open Library: {ol_count} requests", "info")
+        self.log_line(f"ISBNdb: {isbndb_count} requests", "info")
+        self.log_line(f"Total cache: {google_count + ol_count + isbndb_count} entradas", "info")
+        
+    except:
+        self.log_line("Estatísticas não disponíveis", "warning")
 # ------------------------------ Teste de Conexão ------------------------------
 
 def test_internet_connection():
@@ -182,6 +292,23 @@ def test_open_library():
 
 # ------------------------------ Utilidades ------------------------------
 
+def buscar_url_capa(titulo, autor):
+    """Busca URL da capa do livro"""
+    try:
+        query = f"{titulo} {autor}" if autor else titulo
+        url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults=1"
+        
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if "items" in data and len(data["items"]) > 0:
+                volume_info = data["items"][0].get("volumeInfo", {})
+                image_links = volume_info.get("imageLinks", {})
+                return image_links.get("thumbnail") or image_links.get("small")
+    except:
+        pass
+    return None
+
 def clean_search_query(text):
     """Limpa completamente a query de busca"""
     if not text:
@@ -191,7 +318,7 @@ def clean_search_query(text):
     junk_patterns = [
         r'\(z-library\)', r'\(z-lib\)', r'\(libgen\)', r'\(pdf\)', r'\(epub\)', 
         r'\bmicrosoft\s+word\b',  # Remove "Microsoft Word" como frase
-        r'\[.*?\]', r'\(.*?\)', r'\d+p', r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar)$',
+        r'\[.*?\]', r'\(.*?\)', r'\d+p', r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar|doc)$',
         r'www\.\w+\.com', r'\.com', r'\.org', r'\.net', r'http[s]?://',
         r'\[1\]', r'\.\.\.', r'\b\w*libgen\w*\b', r'\b\w*zlib\w*\b',
         r'\b\w*download\w*\b', r'\b\w*free\w*\b', r'\b\w*ebook\w*\b'
@@ -336,112 +463,292 @@ def token_score(a: str, b: str) -> float:
     inter = len(at & bt)
     uni = len(at | bt)
     return inter / max(1, uni)
-
-def extract_metadata_from_filename(filename):
-    """Extrai metadados do nome do arquivo de forma inteligente"""
-    name, ext = os.path.splitext(filename)
-    
-    # Primeiro, limpar lixo digital
-    name = clean_search_query(name)
-    
-    # Padrões comuns de nomes de livros
-    patterns = [
-        # Padrão: Autor - Título
-        r'^(.*?)[\s\-–—]+([^\-–—]+)$',
-        # Padrão: Título - Autor  
-        r'^([^\-–—]+)[\s\-–—]+(.*?)$',
-        # Padrão: Título por Autor
-        r'^(.+?)\s+por\s+(.+?)$',
-        # Padrão: Título (Autor)
-        r'^(.+?)\s*[\(\[](.+?)[\)\]]$',
-        # Autor - Título (Ano)
-        r'^(.*?)[\s\-–—]+(.+?)(?:\s*\((\d{4})\))?$',
-        # Título - Autor (Ano)
-        r'^(.+?)[\s\-–—]+(.*?)(?:\s*\((\d{4})\))?$',
-    ]
-    
-    for pattern in patterns:
-        match = re.match(pattern, name, re.IGNORECASE)
-        if match:
-            part1, part2 = match.groups()
-            part1 = part1.strip()
-            part2 = part2.strip()
-            
-            # Heurística para determinar qual é autor e qual é título
-            if looks_like_author(part1) and looks_like_title(part2):
-                return {'title': part2, 'authors': [part1]}
-            elif looks_like_title(part1) and looks_like_author(part2):
-                return {'title': part1, 'authors': [part2]}
-            elif looks_like_title(part1) and looks_like_title(part2):
-                # Ambos parecem títulos, usar o mais longo como título
-                if len(part1) > len(part2):
-                    return {'title': part1, 'authors': None}
-                else:
-                    return {'title': part2, 'authors': None}
-    
-    # Fallback: se não conseguiu separar, usar tudo como título
-    return {'title': name, 'authors': None}
-
-def looks_like_author(text):
-    """Verifica se o texto parece ser um nome de autor"""
-    if not text or len(text) < 3:
-        return False
-    
-    # Autores geralmente têm 2-3 palavras
-    words = text.split()
-    if len(words) > 4:
-        return False
-    
-    # Verificar padrões de nome
-    if (re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+', text) or  # Nome Sobrenome
-        re.match(r'^[A-Z][a-z]+, [A-Z][a-z]+', text)):  # Sobrenome, Nome
-        return True
-    
-    # Nomes comuns de autores conhecidos
-    known_authors = ['stephen king', 'agatha christie', 'j.k. rowling', 'paulo coelho', 
-                    'dan brown', 'george r.r. martin', 'j.r.r. tolkien', 'rick riordan']
-    
-    if text.lower() in known_authors:
-        return True
-    
-    return False
-
 def extract_title_author_from_filename(filename):
     """Extrai título e autor do nome do arquivo considerando padrões comuns"""
     
+    # Primeiro, verificar se há correspondência exata com autores conhecidos
+    for author in KNOWN_AUTHORS:
+        if author.lower() in filename.lower():
+            # Extrair o título baseado na posição do autor
+            author_lower = author.lower()
+            filename_lower = filename.lower()
+            author_start = filename_lower.find(author_lower)
+            
+            # Se o autor está no início
+            if author_start == 0:
+                # Padrão: Autor - Título
+                remaining_text = filename[len(author):].strip()
+                if remaining_text and remaining_text[0] in ('-', '–', '—', ':'):
+                    title = remaining_text[1:].strip()
+                    if title and looks_like_title(title):
+                        return title, author
+            
+            # Se o autor está no final
+            else:
+                # Padrão: Título - Autor
+                title = filename[:author_start].strip()
+                if title and (title.endswith(('-', '–', '—')) or looks_like_title(title)):
+                    if title.endswith(('-', '–', '—')):
+                        title = title[:-1].strip()
+                    if title and looks_like_title(title):
+                        return title, author
+    
     # Padrões comuns de nomes de arquivos de livros
     patterns = [
-        # Padrão: Título - Autor (Ano)
+        # 1. Título - Autor (Ano)
         r'^(.*?)\s*[-–—]\s*(.*?)\s*[\(\[]\d{4}[\)\]]',
-        # Padrão: Autor - Título (Ano)
+        # 2. Autor - Título (Ano)
         r'^(.*?)\s*[-–—]\s*(.*?)\s*[\(\[]\d{4}[\)\]]',
-        # Padrão: Título - Autor
+        # 3. Título (Ano) - Autor
+        r'^(.*?)\s*[\(\[](\d{4})[\)\]]\s*[-–—]\s*(.*?)$',
+        # 4. Autor (Ano) - Título
+        r'^(.*?)\s*[\(\[](\d{4})[\)\]]\s*[-–—]\s*(.*?)$',
+        # 5. Título - Autor
         r'^(.*?)\s*[-–—]\s*(.*?)$',
-        # Padrão: Autor - Título  
+        # 6. Autor - Título
         r'^(.*?)\s*[-–—]\s*(.*?)$',
-        # Padrão: Título por Autor
-        r'^(.*?)\s+por\s+(.*?)$',
+        # 7. Título por Autor
+        r'^(.*?)\s+(?:por|by)\s+(.*?)$',
+        # 8. Autor: Título
+        r'^(.*?)\s*:\s*(.*?)$',
+        # 9. Título, Autor
+        r'^(.*?)\s*,\s*(.*?)$',
     ]
     
     for pattern in patterns:
         match = re.match(pattern, filename, re.IGNORECASE)
         if match:
-            part1, part2 = match.groups()
-            part1 = part1.strip()
-            part2 = part2.strip()
+            # Pega os grupos não numéricos (ignora ano quando existir)
+            groups = [g.strip() for g in match.groups() if g and not g.isdigit()]
+            if len(groups) < 2:
+                continue
             
-            # Determinar qual parte é título e qual é autor
+            part1, part2 = groups[0], groups[1]
+            
+            # Verificar se alguma parte é um autor conhecido exato
+            if part1.lower() in KNOWN_AUTHORS and looks_like_title(part2):
+                return part2, part1  # Título, Autor
+            elif part2.lower() in KNOWN_AUTHORS and looks_like_title(part1):
+                return part1, part2  # Título, Autor
+            
+            # Determinar qual parte é título e qual é autor usando heurística
             if looks_like_author(part1) and looks_like_title(part2):
                 return part2, part1  # Título, Autor
             elif looks_like_title(part1) and looks_like_author(part2):
                 return part1, part2  # Título, Autor
-            elif looks_like_title(part1) and looks_like_title(part2):
-                return part1, None  # Assumir que a primeira parte é título
             else:
-                return part2, part1  # Tentativa genérica
+                # Por padrão, assume part1 = título e part2 = autor
+                return part1, part2
     
     # Se não encontrou padrão, retornar o nome completo como título
     return filename, None
+
+def extract_metadata_from_filename(filename):
+    """Extrai metadados do nome do arquivo de forma inteligente"""
+    
+    # Extrair ano primeiro
+    year = extract_year_from_filename(filename)
+    
+    # 1. PRIMEIRO: Fazer uma limpeza BÁSICA para análise inicial
+    name_basic_clean = re.sub(r'\[\d+\]', '', filename)  # Remover [1], [2]
+    name_basic_clean = re.sub(r'[+_]{2,}', ' ', name_basic_clean)
+    name_basic_clean = re.sub(r'\s+', ' ', name_basic_clean).strip()
+    
+    # 2. Tentar padrões com parênteses PRIMEIRO (mais confiáveis)
+    paren_patterns = [
+        r'^(.+?)\s*[\(\[](.+?)[\)\]]',  # Título (Autor)
+    ]
+    
+    for pattern in paren_patterns:
+        try:
+            match = re.match(pattern, name_basic_clean, re.IGNORECASE)
+            if match:
+                groups = [g.strip() for g in match.groups() if g and g.strip()]
+                if len(groups) >= 2 and looks_like_title(groups[0]) and looks_like_author(groups[1]):
+                    return {
+                        'title': groups[0],
+                        'authors': [groups[1]],
+                        'publishedDate': year
+                    }
+        except:
+            continue
+    
+    # 3. Tentar separadores no nome básico limpo
+    for separator in [' - ', ' – ', ' — ']:
+        if separator in name_basic_clean:
+            parts = name_basic_clean.split(separator)
+            if len(parts) >= 2:
+                part1 = parts[0].strip()
+                part2 = separator.join(parts[1:]).strip()
+                
+                # Verificar combinações
+                if looks_like_author(part1) and looks_like_title(part2):
+                    return {
+                        'title': part2,
+                        'authors': [part1],
+                        'publishedDate': year
+                    }
+                elif looks_like_title(part1) and looks_like_author(part2):
+                    return {
+                        'title': part1,
+                        'authors': [part2],
+                        'publishedDate': year
+                    }
+    
+    # 4. AGORA fazer limpeza mais agressiva
+    name_clean = clean_search_query_nome_arquivo(filename)
+    
+    # 5. Tentar separadores na versão limpa
+    for separator in [' - ', ' – ', ' — ']:
+        if separator in name_clean:
+            parts = name_clean.split(separator)
+            if len(parts) >= 2:
+                part1 = parts[0].strip()
+                part2 = separator.join(parts[1:]).strip()
+                
+                if looks_like_author(part1) and looks_like_title(part2):
+                    return {
+                        'title': part2,
+                        'authors': [part1],
+                        'publishedDate': year
+                    }
+                elif looks_like_title(part1) and looks_like_author(part2):
+                    return {
+                        'title': part1,
+                        'authors': [part2],
+                        'publishedDate': year
+                    }
+    
+    # 6. Fallback: se tem " - " mas não conseguiu separar, usar lógica simples
+    if ' - ' in name_clean:
+        parts = name_clean.split(' - ', 1)  # Dividir apenas no primeiro separador
+        if len(parts) == 2:
+            part1, part2 = parts[0].strip(), parts[1].strip()
+            # Se a primeira parte é curta, provavelmente é autor
+            if len(part1.split()) <= 3 and len(part2.split()) > 1:
+                return {
+                    'title': part2,
+                    'authors': [part1],
+                    'publishedDate': year
+                }
+    
+    # 7. ÚLTIMO: Fallback final
+    return {'title': name_clean, 'authors': None, 'publishedDate': year}
+    
+   
+def looks_like_author(text: str) -> bool:
+    """Verifica se o texto parece ser um nome de autor"""
+    if not text or len(text) < 3:
+        return False
+    
+    text = text.strip()
+    words = text.split()
+    score = 0
+    
+    # Não pode ser muito curto ou conter apenas números
+    if len(text) < 2 or text.isdigit():
+        return False
+    
+    # 0. REGRA NOVA: Não pode ser uma única letra ou número
+    if len(text) <= 2 or text.isdigit() or text in ['a', 'o', 'as', 'os', 'um', 'uma']:
+        return False
+    
+    # Não pode conter palavras comuns de lixo
+    junk_words = ['reidoebook', 'com', 'net', 'org', 'pdf', 'epub', 'documento', 'texto']
+    if any(junk in text.lower() for junk in junk_words):
+        return False
+    
+    # Verificar se está na lista de autores conhecidos
+    if any(author.lower() == text.lower() for author in KNOWN_AUTHORS):
+        return True
+    
+    
+    # 1. Começa com letra maiúscula em cada palavra (apenas palavras alfabéticas)
+    if all(word and word[0].isupper() for word in words if word.isalpha()):
+        score += 1
+    
+    # 2. Máximo 4 palavras (autores raramente têm mais)
+    if len(words) <= 4:
+        score += 1
+    
+    # 3. Contém sobrenomes comuns
+    common_surnames = ['king', 'brown', 'coelho', 'rowling', 'martin', 'tolkien', 
+                      'riordan', 'crichton', 'assis', 'lispector', 'amado', 'verissimo',
+                      'cury', 'green', 'sparks', 'sheldon', 'follett', 'koontz']
+    if any(surname.lower() in text.lower() for surname in common_surnames):
+        score += 1
+    
+    # 4. Está na lista de autores conhecidos (com peso maior)
+    if any(author.lower() == text.lower() for author in KNOWN_AUTHORS):
+        score += 2  # peso maior para autores exatos
+    
+    # 5. REGRA NOVA: Deve conter pelo menos 2 letras em cada palavra significativa
+    meaningful_words = [word for word in words if len(word) > 2 and word.isalpha()]
+    if len(meaningful_words) >= 2:
+        score += 1
+    
+    # 6. REGRA NOVA: Não pode conter apenas stopwords
+    stopwords = ['the', 'and', 'or', 'of', 'de', 'da', 'do', 'das', 'dos', 'a', 'o', 'as', 'os']
+    if all(word.lower() in stopwords for word in words):
+        return False
+    
+    return score >= 3  # Aumentei o threshold para 3
+
+def looks_like_title(text: str) -> bool:
+    """Verifica se o texto parece ser um título usando heurística mais flexível"""
+    if not text or len(text) < 3:
+        return False
+    
+    text = text.strip()
+    
+    # Títulos muito longos são suspeitos
+    if len(text) > 150:
+        return False
+    
+    # Títulos não devem ser apenas números
+    if text.isdigit():
+        return False
+    
+    # Títulos não devem ser apenas letras maiúsculas (exceto siglas)
+    if text.isupper() and len(text) > 8:
+        return False
+    
+    # Títulos geralmente têm múltiplas palavras ou são significativos
+    words = text.split()
+    
+    # Se tem múltiplas palavras, provavelmente é título
+    if len(words) >= 2:
+        return True
+    
+    # Títulos de uma palavra devem ser significativos
+    if len(words) == 1 and len(text) > 4:
+        return True
+    
+    return False
+
+def extract_year_from_filename(text):
+    """Extrai ano de uma string de filename"""
+    try:
+        # Padrões de ano: (1999), [1999], 1999, - 1999, etc.
+        patterns = [
+            r'[\(\[](\d{4})[\)\]]',  # (1999) ou [1999]
+            r'\b(\d{4})\b',           # 1999 (standalone)
+            r'[-–—](\d{4})[-–—]',     # -1999-
+            r'\s(\d{4})\s',           # espaço1999espaço
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                year = match.group(1)
+                # Validar se é um ano plausível (entre 1000 e ano atual + 1)
+                current_year = datetime.now().year
+                if year.isdigit() and 1000 <= int(year) <= current_year + 1:
+                    return year
+    except:
+        pass
+    return None
+
     
 def clean_search_query_metadados(text):
     """Limpeza para metadados - remove apenas lixo digital"""
@@ -450,62 +757,155 @@ def clean_search_query_metadados(text):
     
     # Remover apenas lixo digital óbvio
     junk_patterns = [
-        r'\(z-library\)', r'\(z-lib\)', r'\(libgen\)', 
-        r'www\.\w+\.\w+', r'http[s]?://\S+',
-        r'\[.*?\]', r'\(.*?\)'
+        r'\(z-library\)', r'\(z-lib\)', r'\(libgen\)', r'\(pdf\)', r'\(epub\)', 
+        r'\bmicrosoft\s+word\b', r'\(pdfcofee\)',  # Remove "Microsoft Word" como frase
+        r'\[.*?\]', r'\(.*?\)', r'\d+p', r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar)$',
+        r'www\.\w+\.com', r'\.com', r'\.org', r'\.net', r'http[s]?://',
+        r'\[1\]', r'\.\.\.', r'\b\w*libgen\w*\b', r'\b\w*zlib\w*\b',
+        r'\b\d+p\b', r'\b\d+k\b', r'\[\d+\]',
+        r'reidoebook', r'livrosparatodos', r'z-lib',r'pdf-free',
+        r'\.com', r'\.net', r'\.org'
+        r'\b\w*download\w*\b', r'\b\w*free\w*\b', r'\b\w*ebook\w*\b'
     ]
     
     for pattern in junk_patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+    # Normalizar forma Unicode (ajuda com traços e espaços especiais)
+    text = unicodedata.normalize('NFKC', text)
     
+    # Substituir espaços "invisíveis" por espaço normal
+    text = re.sub(r'[\u00A0\u2007\u202F]', ' ', text)
+
+    # Unificar traços unicode em hífen ASCII
+    text = re.sub(r'[\u2012\u2013\u2014\u2212\u2043\uFE63\uFF0D]', '-', text)
+
+    # Substituir underlines por espaços, mas manter hífens (podem ser separadores)
+    #text = re.sub(r'_', ' ', text)
+    
+    # Substituir underlines e + por espaços
+    text = re.sub(r'[_+]+', ' ', text)
+    
+    # Remover pontos extras que não são abreviações (como "livro.nome.pdf")
+    # Mantém pontos se estiverem entre letras maiúsculas (abreviações: "J. K. Rowling")
+    text = re.sub(r'(?<!\b[A-Z])\.(?![A-Z]\b)', ' ', text)
+    
+    # Remover extensões de arquivo
+    text = re.sub(r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar)$', '', text, flags=re.IGNORECASE)
+
+    # Substituir traços grudados em palavras por espaço (mas manter os que têm espaço dos dois lados)
+    text = re.sub(r'(?<=\w)-(?=\w)', ' ', text)
+    # Remover traços no início ou no fim do nome (isolados ou múltiplos)
+    #text = re.sub(r'^-+\s*', '', text)  # Remove traços no início
+    #text = re.sub(r'\s*-+$', '', text)  # Remove traços no final
+    # Remover traços no início ou no fim, tolerando espaços e qualquer quantidade deles
+    # (agora pega " - Título", "- Título", "Título -", "Título -   ")
+    text = re.sub(r'^\s*-+\s*', '', text)   # início
+    text = re.sub(r'\s*-+\s*$', '', text)   # fim
+
+    # Remover prefixos irrelevantes no início do nome
+    irrelevant_prefixes = [
+        'pdfcoffee', 'livrosparatodos', 'reidoebook', 'docero', 'zlibrary', 'libgen',
+        'ebooksgratis', 'baixarlivros', 'downloadlivros', 'freebook', 'biblioteca'
+        ]
+    for prefix in irrelevant_prefixes:
+        text = re.sub(rf'^{prefix}\s+', '', text, flags=re.IGNORECASE)
+        
+        
     # Manter a estrutura original do texto
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
 
 def clean_search_query_nome_arquivo(text):
-    """Limpeza para nome do arquivo - remove lixo mas mantém separadores"""
+    """Limpeza para nome do arquivo - remove lixo mas mantém informações importantes"""
     if not text:
         return ""
     
-    # Remover lixo digital
+    # Remover números entre colchetes [1], [2], etc.
+    text = re.sub(r'\[\d+\]', '', text)
+    
+    # Remover padrões específicos de lixo
     junk_patterns = [
-        r'\(z-library\)', r'\(z-lib\)', r'\(libgen\)', 
-        r'www\.\w+\.\w+', r'http[s]?://\S+',
-        r'\[.*?\]', r'\(.*?\)', r'\.\.\.',
+        r'\(z-library\)', r'\(z-lib\)', r'\(libgen\)', r'\(pdf\)', r'\(epub\)', 
+        r'\bmicrosoft\s+word\b', r'\(pdfcofee\), r'r'\blivro\s+de\b',  # Remove "Microsoft Word" como frase
+        r'\[.*?\]', r'\(.*?\)', r'\d+p', r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar)$',
+        r'www\.\w+\.com', r'\.com', r'\.org', r'\.net', r'http[s]?://',
+        r'\[1\]', r'\.\.\.', r'\b\w*libgen\w*\b', r'\b\w*zlib\w*\b',
         r'\b\d+p\b', r'\b\d+k\b', r'\[\d+\]',
-        r'reidoebook', r'livrosparatodos', r'z-lib',
+        r'reidoebook', r'livrosparatodos', r'z-lib',r'pdf-free',
         r'\.com', r'\.net', r'\.org'
+        r'\b\w*download\w*\b', r'\b\w*free\w*\b', r'\b\w*ebook\w*\b'
     ]
     
     for pattern in junk_patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
     
+    # Normalizar forma Unicode (ajuda com traços e espaços especiais)
+    text = unicodedata.normalize('NFKC', text)
+    
+    # Substituir espaços "invisíveis" por espaço normal
+    text = re.sub(r'[\u00A0\u2007\u202F]', ' ', text)
+    
+    # Unificar traços unicode em hífen ASCII
+    text = re.sub(r'[\u2012\u2013\u2014\u2212\u2043\uFE63\uFF0D]', '-', text)
+    
+    # Remover sequências de caracteres especiais
+    text = re.sub(r'[+_]{2,}', ' ', text)  # ++, +_+, etc.
+    text = re.sub(r'\.{2,}', ' ', text)    # .., ..., etc.
+    
     # Substituir underlines por espaços, mas manter hífens (podem ser separadores)
-    text = re.sub(r'_', ' ', text)
+    #text = re.sub(r'_', ' ', text)
+    
+    # Substituir underlines e + por espaços
+    text = re.sub(r'[+_]', ' ', text)
+    
+    # Remover pontos extras que não são abreviações (como "livro.nome.pdf")
+    # Mantém pontos se estiverem entre letras maiúsculas (abreviações: "J. K. Rowling")
+    text = re.sub(r'(?<!\b[A-Z])\.(?![A-Z]\b)', ' ', text)
+    
+    # Substituir traços grudados em palavras por espaço (mas manter os que têm espaço dos dois lados)
+    text = re.sub(r'(?<=\w)-(?=\w)', ' ', text)
+    # Remover traços no início ou no fim do nome (isolados ou múltiplos)
+    #text = re.sub(r'^-+\s*', '', text)  # Remove traços no início
+    #text = re.sub(r'\s*-+$', '', text)  # Remove traços no final
+    # Remover traços no início ou no fim, tolerando espaços e qualquer quantidade deles
+    # (agora pega " - Título", "- Título", "Título -", "Título -   ")
+    text = re.sub(r'^\s*-+\s*', '', text)   # início
+    text = re.sub(r'\s*-+\s*$', '', text)   # fim
     
     # Remover extensões de arquivo
     text = re.sub(r'\.(pdf|epub|mobi|azw3|docx?|txt|zip|rar)$', '', text, flags=re.IGNORECASE)
     
+    # Remover números isolados entre espaços (mas manter números que fazem parte do texto)
+    text = re.sub(r'\s\d+\s', ' ', text)   # espaços + números + espaços
+    text = re.sub(r'^\d+\s', '', text)     # números no início
+    text = re.sub(r'\s\d+$', '', text)     # números no final
+    
+    # Remover "documento de texto" e variações
+    doc_patterns = [
+        r'novo\s*(?:documento|arquivo|file)',
+        r'novo\s*(?:doc|txt|texto)',
+        r'documento\s*(?:de\s*texto|sem\s*título)',
+        r'untitled', r'sem título'
+    ]
+    
+    for pattern in doc_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
     # Normalizar espaços
     text = re.sub(r'\s+', ' ', text).strip()
     
+    # Se ficou muito curto após limpeza, usar o original
+    if len(text) < 3:
+        # Fallback: limpeza mínima
+        original_text = re.sub(r'\[\d+\]', '', text)
+        original_text = re.sub(r'[+_]{2,}', ' ', original_text)
+        original_text = re.sub(r'[+_]', ' ', original_text)
+        original_text = re.sub(r'\s+', ' ', original_text).strip()
+        return original_text
+    
     return text
-
-def looks_like_title(text):
-    """Verifica se o texto parece ser um título"""
-    if not text or len(text) < 3:
-        return False
-    
-    # Títulos geralmente são mais longos que autores
-    if len(text) < 5:
-        return False
-    
-    # Títulos não devem ser apenas iniciais
-    if re.match(r'^[A-Z\.\s]+$', text):
-        return False
-    
-    return True
     
 def extract_isbn(filepath):
     """Tenta extrair ISBN de arquivos com tratamento de erro robusto"""
@@ -1076,6 +1476,102 @@ def apply_text_normalization(meta, remover_acentos_flag, limpar_caracteres_flag)
     
     return result
 
+def buscar_metadados_inteligente(titulo, autor, api_key=None):
+    """Busca em múltiplas fontes com fallback inteligente"""
+    
+    # 1. Tentar cache primeiro
+    cache_key = f"{titulo}_{autor}_{api_key}"
+    cached = get_cached_data(cache_key)
+    if cached:
+        return cached
+    
+    # 2. Tentar Google Books (com tratamento de limite)
+    try:
+        resultado = buscar_google_books(titulo, autor, api_key)
+        if resultado and resultado.get('score', 0) > 0.4:
+            set_cached_data(cache_key, resultado)
+            return resultado
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:  # Too Many Requests
+            print("Limite do Google Books excedido, usando fallbacks...")
+            # Continuar para outros métodos
+    
+    # 3. Tentar Open Library
+    resultado = buscar_open_library(titulo, autor)
+    if resultado and resultado.get('score', 0) > 0.4:
+        set_cached_data(cache_key, resultado)
+        return resultado
+    
+    # 4. Tentar outras fontes alternativas
+    resultado = buscar_isbndb(titulo, autor)  # ISBNdb (requer API key)
+    if resultado:
+        set_cached_data(cache_key, resultado)
+        return resultado
+        
+    resultado = buscar_google_custom_search(titulo, autor)  # Google Custom Search
+    if resultado:
+        set_cached_data(cache_key, resultado)
+        return resultado
+    
+    return None
+    
+def buscar_google_custom_search(titulo, autor, api_key=None, search_engine_id=None):
+    """Usa Google Custom Search API como fallback"""
+    if not api_key or not search_engine_id:
+        return None
+        
+    try:
+        query = f"{titulo} {autor} livro" if autor else f"{titulo} livro"
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'q': query,
+            'key': api_key,
+            'cx': search_engine_id,
+            'num': 3
+        }
+        
+        response = requests.get(url, params=params, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            if 'items' in data:
+                # Extrair informações dos resultados
+                for item in data['items']:
+                    if any(term in item.get('title', '').lower() for term in ['book', 'livro', 'author', 'autor']):
+                        return extrair_metadados_de_html(item)
+    except:
+        pass
+    return None
+    
+def buscar_isbndb(titulo, autor, api_key=None):
+    """Usa ISBNdb.com API"""
+    if not api_key:
+        return None
+        
+    try:
+        query = f"{titulo} {autor}" if autor else titulo
+        url = f"https://api2.isbndb.com/books/{query}"
+        headers = {
+            'Authorization': api_key,
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            if 'books' in data and len(data['books']) > 0:
+                book = data['books'][0]
+                return {
+                    'title': book.get('title'),
+                    'authors': [book.get('author')] if book.get('author') else [],
+                    'publishedDate': book.get('date_published'),
+                    'categories': book.get('subjects', []),
+                    'fonte': 'ISBNdb',
+                    'score': 0.7
+                }
+    except:
+        pass
+    return None
+
 def buscar_google_books(titulo, autor, api_key=None):
     """Consulta Google Books API usando título e autor de forma inteligente"""
     try:
@@ -1233,18 +1729,25 @@ def baixar_capa(url, caminho, fonte):
 # ------------------------------ Metadados locais ------------------------------
 
 def extract_local_metadata(path, ext):
-    """Extrai metadados locais baseado na extensão do arquivo"""
+    """Extrai metadados locais com tratamento robusto de erro"""
     metadata = {}
     
     try:
         if ext == '.epub':
             metadata = read_epub_metadata(path)
         elif ext == '.pdf':
-            metadata = read_pdf_metadata(path)
+            try:
+                metadata = read_pdf_metadata(path)
+            except Exception as pdf_error:
+                print(f"Erro crítico ao ler PDF {path}: {pdf_error}")
+                metadata = try_pdf_fallback_simple(path)
         elif ext in ['.doc', '.docx', '.rtf']:
             metadata = extract_office_metadata(path)
     except Exception as e:
         print(f"Erro ao extrair metadados locais de {path}: {e}")
+        # Tentar fallback genérico
+        if ext == '.pdf':
+            metadata = try_pdf_fallback_simple(path)
     
     return metadata
 
@@ -1280,25 +1783,54 @@ def read_pdf_metadata(path: str) -> Dict[str, Any]:
     
     try:
         with open(path, 'rb') as f:
-            # Verificar se o arquivo é um PDF válido antes de tentar ler
             try:
+                # Usar approach mais robusto do PyPDF2
                 reader = PyPDF2.PdfReader(f)
                 
-                # Verificar se o PDF está criptografado ou corrompido
-                if (hasattr(reader, 'metadata') and reader.metadata):
+                # Verificar se o PDF está criptografado
+                if reader.is_encrypted:
+                    try:
+                        reader.decrypt('')  # Tentar senha vazia
+                    except:
+                        logfn(f"PDF criptografado: {os.path.basename(path)}", "warning")
+                        return data
+                
+                # Tentar extrair metadados de forma segura
+                if hasattr(reader, 'metadata') and reader.metadata:
                     info = reader.metadata
                     if info:
                         if info.title and str(info.title).strip():
                             data['title'] = normalize_spaces(str(info.title))
                         if info.author and str(info.author).strip():
                             data['authors'] = [normalize_spaces(str(info.author))]
+                
+                # Se não encontrou metadados, tentar extrair da primeira página
+                if not data.get('title') and len(reader.pages) > 0:
+                    try:
+                        page_text = reader.pages[0].extract_text()
+                        if page_text:
+                            # Procurar título nas primeiras linhas
+                            lines = page_text.split('\n')
+                            for line in lines[:10]:  # Primeiras 10 linhas
+                                line = line.strip()
+                                if (len(line) > 10 and len(line) < 100 and 
+                                    not line.isdigit() and 
+                                    not re.match(r'^\d+$', line) and
+                                    not re.match(r'^[A-Z\s]+$', line)):  # Não tudo maiúsculo
+                                    data['title'] = line[:80]  # Limitar tamanho
+                                    break
+                    except Exception as page_error:
+                        print(f"Erro ao extrair texto da página: {page_error}")
+                        
             except Exception as inner_error:
-                # Se falhar, tentar método alternativo
-                print(f"Erro ao ler PDF {path} (tentando fallback): {inner_error}")
+                print(f"Erro interno PDF {path}: {inner_error}")
+                # Fallback para método alternativo
                 return try_pdf_fallback(path)
                 
     except Exception as e:
         print(f"Erro ao abrir PDF {path}: {e}")
+        # Tentar fallback para arquivos muito corrompidos
+        return try_pdf_fallback_simple(path)
     
     return data
 
@@ -1308,26 +1840,63 @@ def try_pdf_fallback(path):
     try:
         # Tentar extrair texto das primeiras páginas para encontrar título
         with open(path, 'rb') as f:
-            reader = PyPDF2.PdfReader(f)
-            if len(reader.pages) > 0:
-                # Ler apenas primeira página para evitar problemas
-                try:
-                    page_text = reader.pages[0].extract_text()
-                    if page_text:
-                        # Procurar padrões de título
-                        lines = page_text.split('\n')
-                        for line in lines[:5]:  # Primeiras 5 linhas
-                            line = line.strip()
-                            if (len(line) > 10 and len(line) < 100 and 
-                                not line.isdigit() and 
-                                not re.match(r'^\d+$', line) and
-                                not re.match(r'^[A-Z\s]+$', line)):  # Não tudo maiúsculo
-                                data['title'] = line[:80]  # Limitar tamanho
-                                break
-                except:
-                    pass  # Ignorar erro na extração de texto
+            # Ler apenas os primeiros bytes para evitar problemas
+            content = f.read(50000)  # 50KB
+            text = content.decode('utf-8', errors='ignore')
+            
+            # Padrões de metadados em PDF
+            patterns = [
+                r'/Title\s*\(([^)]+)\)',
+                r'/Author\s*\(([^)]+)\)',
+                r'Title:\s*(.*?)\n',
+                r'Author:\s*(.*?)\n',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    if 'Title' in pattern and not data.get('title'):
+                        data['title'] = normalize_spaces(match)
+                    elif 'Author' in pattern and not data.get('authors'):
+                        data['authors'] = [normalize_spaces(match)]
+            
+            # Se não encontrou, procurar texto que pareça título
+            if not data.get('title'):
+                # Procurar por linhas com texto significativo
+                lines = text.split('\n')
+                for line in lines[:50]:  # Primeiras 50 linhas
+                    line = line.strip()
+                    if (len(line) > 10 and len(line) < 100 and
+                        not line.isdigit() and
+                        not re.match(r'^[\d\W]+$', line)):
+                        data['title'] = line[:80]
+                        break
+    
+    except Exception as e:
+        print(f"Erro no fallback PDF {path}: {e}")
+    
+    return data
+
+def try_pdf_fallback_simple(path):
+    """Fallback extremamente simples para PDFs muito corrompidos"""
+    data = {}
+    try:
+        # Apenas ler os primeiros bytes e procurar padrões simples
+        with open(path, 'rb') as f:
+            content = f.read(2000)  # Apenas 2KB
+            text = content.decode('utf-8', errors='ignore')
+            
+            # Procurar padrões muito básicos
+            title_match = re.search(r'Title[:\s]*([^\n\r]+)', text, re.IGNORECASE)
+            author_match = re.search(r'Author[:\s]*([^\n\r]+)', text, re.IGNORECASE)
+            
+            if title_match:
+                data['title'] = normalize_spaces(title_match.group(1))
+            if author_match:
+                data['authors'] = [normalize_spaces(author_match.group(1))]
+    
     except:
-        pass  # Ignorar qualquer erro no fallback
+        pass  # Ignorar qualquer erro no fallback simples
     
     return data
 
@@ -1439,6 +2008,29 @@ def merge_metadata(local: Dict[str, Any], api: Dict[str, Any]) -> Dict[str, Any]
     
     return merged
 
+# ------------------------------ Modo de Simulação ------------------------------
+def buscar_simulacao(titulo, autor):
+    """Modo simulação para quando APIs estão offline"""
+    # Simular resultados baseados em padrões comuns
+    if "harry potter" in titulo.lower():
+        return {
+            'title': "Harry Potter",
+            'authors': ["J.K. Rowling"],
+            'publishedDate': "1997",
+            'categories': ["Fantasy"],
+            'fonte': 'Simulação',
+            'score': 0.6
+        }
+    elif "senhor dos anéis" in titulo.lower():
+        return {
+            'title': "O Senhor dos Anéis",
+            'authors': ["J.R.R. Tolkien"],
+            'publishedDate': "1954",
+            'categories': ["Fantasy"],
+            'fonte': 'Simulação',
+            'score': 0.6
+        }
+    return None
 # ------------------------------ Organização e arquivo ------------------------------
 
 def choose_primary_author(authors: Optional[List[str]]) -> str:
@@ -1550,186 +2142,154 @@ def process_file(path: str,
                  remover_acentos_flag: bool,
                  limpar_caracteres_flag: bool,
                  logfn) -> ActionLog:
-    """Processa um arquivo de livro seguindo o fluxo CORRETO"""
-
-    # Verificar se o arquivo existe
+    """Processa um arquivo de livro de forma otimizada e robusta"""
+    
+    # Verificação inicial de existência do arquivo
     if not os.path.exists(path):
         logfn(f"AVISO: Arquivo não encontrado: {os.path.basename(path)}", "warning")
-        return ActionLog(
-            source_path=path,
-            dest_path="",
-            title="Arquivo não encontrado",
-            author="",
-            year="",
-            genre="",
-            cover_path="",
-            status="skipped",
-            note="Arquivo não existe",
-            fonte="Sistema"
-        )
+        return create_action_log(path, "", "Arquivo não encontrado", "", "", "", "", "skipped", "Arquivo não existe", "Sistema")
 
     ext = os.path.splitext(path)[1].lower()
     filename = os.path.basename(path)
-    fonte = "Não identificado"
-    meta = {}
-    has_sufficient_metadata = False
-    isbn = None
-
+    
     logfn(f"=== PROCESSANDO: {filename} ===", "info")
+    
+    # 1. Extração de ISBN e busca prioritária
+    isbn_meta = extract_and_search_isbn(path, api_key, logfn)
+    if isbn_meta and isbn_meta.get('isbn_found'):
+        return process_successful_metadata(path, out_base, organize_mode, pattern, 
+                                         download_covers, isbn_meta, ext, logfn,
+                                         remover_acentos_flag, limpar_caracteres_flag)
 
-    # === 1. EXTRAIR ISBN ===
+    # 2. Fallback: Metadados locais + API
+    api_meta = extract_and_search_api(path, ext, api_key, logfn)
+    if api_meta and api_meta.get('api_found'):
+        return process_successful_metadata(path, out_base, organize_mode, pattern,
+                                         download_covers, api_meta, ext, logfn,
+                                         remover_acentos_flag, limpar_caracteres_flag)
+
+    # 3. Fallback final: Nome do arquivo + API
+    filename_meta = extract_and_search_filename(path, api_key, logfn)
+    if filename_meta and filename_meta.get('filename_found'):
+        return process_successful_metadata(path, out_base, organize_mode, pattern,
+                                         download_covers, filename_meta, ext, logfn,
+                                         remover_acentos_flag, limpar_caracteres_flag)
+
+    # 4. Nada encontrado - mover para não localizados
+    return move_to_unknown(path, out_base, filename, logfn)
+
+def extract_and_search_isbn(path, api_key, logfn):
+    """Extrai ISBN e busca na API"""
     logfn("Extraindo ISBN do arquivo...", "info")
     extracted_isbn = extract_isbn_rigorous(path)
     
-    if extracted_isbn:
-        logfn(f"ISBN encontrado: {extracted_isbn}", "info")
-        isbn_result = search_by_isbn(extracted_isbn, api_key)
-        if isbn_result and isbn_result.get('score', 0) > 0.8:
-            meta = isbn_result
-            fonte = isbn_result.get("fonte", "ISBN")
-            has_sufficient_metadata = True
-            isbn = extracted_isbn
-            logfn(f"✓ Livro identificado por ISBN: {meta.get('title', 'Sem título')}", "success")
-        else:
-            logfn(f"✗ ISBN {extracted_isbn} não retornou resultados válidos", "warning")
-            isbn = None
-    else:
+    if not extracted_isbn:
         logfn("ISBN não localizado", "info")
-
-    # === 2. CONSULTAR API COM METADADOS LOCAIS ===
-    if not has_sufficient_metadata:
-        logfn("Extraindo metadados para consulta API...", "info")
-        local_meta = extract_local_metadata(path, ext)
-        
-        # Abordagem 1: METADADOS LOCAIS (limpos mas não fatiados)
-        metadata_search_done = False
-        if local_meta and local_meta.get('title'):
-            title = clean_search_query_metadados(local_meta['title'])
-            author = None
-            if local_meta.get('authors') and local_meta['authors'][0]:
-                author = clean_search_query_metadados(local_meta['authors'][0])
-            
-            logfn(f"Pesquisando com metadados - Título: '{title}', Autor: '{author}'", "info")
-            
-            # Pesquisar com metadados limpos
-            gb_result = buscar_google_books(title, author, api_key)
-            if gb_result:
-                meta = gb_result
-                fonte = "Google Books (Metadados)"
-                has_sufficient_metadata = validate_metadata(meta, fonte)
-                if has_sufficient_metadata:
-                    logfn(f"✓ Identificado via metadados: {gb_result.get('title')}", "success")
-                else:
-                    logfn("✗ Metadados da API insuficientes, tentando nome do arquivo...", "warning")
-                    meta = {}  # Reset para tentar nome do arquivo
-            metadata_search_done = True
-        
-        # Abordagem 2: NOME DO ARQUIVO (se metadados não forem suficientes)
-        if not has_sufficient_metadata:
-            name_only = os.path.splitext(filename)[0]
-            clean_name = clean_search_query_nome_arquivo(name_only)
-            
-            logfn(f"Pesquisando com nome do arquivo: '{clean_name}'", "info")
-            
-            # Tentar extrair título e autor do nome do arquivo
-            title_from_name, author_from_name = extract_title_author_from_filename(clean_name)
-            
-            if title_from_name:
-                logfn(f"Título extraído: '{title_from_name}', Autor: '{author_from_name}'", "info")
-                # Pesquisar com título e autor extraídos
-                gb_result = buscar_google_books(title_from_name, author_from_name, api_key)
-                if gb_result:
-                    meta = gb_result
-                    fonte = "Google Books (Nome Arquivo)"
-                    has_sufficient_metadata = validate_metadata(meta, fonte)
-                    if has_sufficient_metadata:
-                        logfn(f"✓ Identificado via nome arquivo: {gb_result.get('title')}", "success")
-            
-            # Se ainda não encontrou, tentar pesquisa genérica com nome limpo
-            if not has_sufficient_metadata:
-                gb_result = buscar_google_books(clean_name, None, api_key)
-                if gb_result:
-                    meta = gb_result
-                    fonte = "Google Books (Nome Arquivo)"
-                    has_sufficient_metadata = validate_metadata(meta, fonte)
-                    if has_sufficient_metadata:
-                        logfn(f"✓ Identificado via pesquisa genérica: {gb_result.get('title')}", "success")
-
-    # === 3. VALIDAÇÃO FINAL ===
-    has_sufficient_metadata = validate_metadata(meta, fonte)
+        return None
     
-    if not has_sufficient_metadata:
-        logfn("=== RESULTADO: Nenhum resultado válido da API ===", "warning")
-        # ... (código para mover para não localizados) ...
-        logfn("=== RESULTADO: Metadados insuficientes ===", "warning")
-        config = load_config()
-        unknown_dir = get_config_value(config, 'Geral', 'unknown_dirname', '2. Não Localizados')
-        dest_dir = os.path.join(out_base, unknown_dir)
-        os.makedirs(dest_dir, exist_ok=True)
-        
-        clean_name = normalize_unknown_filename(filename)
-        dest_path = os.path.join(dest_dir, clean_name)
-        
-        try:
-            shutil.move(path, dest_path)
-            logfn(f"✗ Movido para: {unknown_dir}/{clean_name}", "warning")
-            
-            return ActionLog(
-                source_path=path,
-                dest_path=dest_path,
-                title=os.path.splitext(filename)[0],
-                author="Desconhecido",
-                year="s.d.",
-                genre="Não Localizado",
-                cover_path="",
-                status="moved_to_unknown",
-                note=f"Fonte: {fonte}, ISBN tentado: {isbn}",
-                fonte=fonte
-            )
-        except Exception as e:
-            logfn(f"ERRO: Falha ao mover para não localizados: {e}", "error")
-            return ActionLog(
-                source_path=path,
-                dest_path=path,
-                title=os.path.splitext(filename)[0],
-                author="Desconhecido",
-                year="s.d.",
-                genre="Erro",
-                cover_path="",
-                status="error",
-                note=str(e),
-                fonte="Erro"
-            )
-    else:
-        logfn("=== RESULTADO: Metadados confirmados pela API ===", "success")
+    logfn(f"ISBN encontrado: {extracted_isbn}", "info")
+    isbn_result = search_by_isbn(extracted_isbn, api_key)
+    
+    if isbn_result and isbn_result.get('score', 0) > 0.8:
+        isbn_result['isbn'] = extracted_isbn
+        isbn_result['isbn_found'] = True
+        logfn(f"✓ Livro identificado por ISBN: {isbn_result.get('title', 'Sem título')}", "success")
+        return isbn_result
+    
+    logfn(f"✗ ISBN {extracted_isbn} não retornou resultados válidos", "warning")
+    return None
 
-    # === 4. PROCESSAMENTO FINAL ===
+def extract_and_search_api(path, ext, api_key, logfn):
+    """Extrai metadados locais e busca na API"""
+    logfn("Extraindo metadados para consulta API...", "info")
+    
+    try:
+        local_meta = extract_local_metadata(path, ext)
+    except Exception as meta_error:
+        logfn(f"⚠️ Erro ao extrair metadados: {meta_error}", "warning")
+        return None
+    
+    if not local_meta or not local_meta.get('title'):
+        return None
+    
+    title = clean_search_query_nome_arquivo(local_meta['title'])
+    author = clean_search_query_nome_arquivo(local_meta['authors'][0]) if local_meta.get('authors') else None
+    
+    logfn(f"Pesquisando com metadados - Título: '{title}', Autor: '{author}'", "info")
+    resultado = buscar_metadados_inteligente(title, author, api_key)
+    
+    if resultado and validate_metadata(resultado, "API"):
+        resultado['api_found'] = True
+        logfn(f"✓ Identificado via metadados: {resultado.get('title')}", "success")
+        return resultado
+    
+    return None
+
+def extract_and_search_filename(path, api_key, logfn):
+    """Extrai metadados do nome do arquivo e busca na API"""
+    filename = os.path.basename(path)
+    name_only = os.path.splitext(filename)[0]
+    clean_name = clean_search_query_nome_arquivo(name_only)
+    
+    logfn(f"Pesquisando com nome do arquivo: '{clean_name}'", "info")
+    
+    # Tentar extrair título e autor do nome
+    title_from_name, author_from_name = extract_title_author_from_filename(clean_name)
+    
+    if title_from_name:
+        logfn(f"Título extraído: '{title_from_name}', Autor: '{author_from_name}'", "info")
+        resultado = buscar_metadados_inteligente(title_from_name, author_from_name, api_key)
+        
+        if resultado and validate_metadata(resultado, "API"):
+            resultado['filename_found'] = True
+            logfn(f"✓ Identificado via nome arquivo: {resultado.get('title')}", "success")
+            return resultado
+    
+    # Tentar pesquisa genérica
+    resultado = buscar_metadados_inteligente(clean_name, None, api_key)
+    if resultado and validate_metadata(resultado, "API"):
+        resultado['filename_found'] = True
+        logfn(f"✓ Identificado via pesquisa genérica: {resultado.get('title')}", "success")
+        return resultado
+    
+    # Último recurso: simulação
+    resultado = buscar_simulacao(clean_name, None)
+    if resultado:
+        resultado['filename_found'] = True
+        logfn(f"⚠️ Usando dados simulados: {resultado.get('title')}", "warning")
+        return resultado
+    
+    return None
+
+def process_successful_metadata(path, out_base, organize_mode, pattern, 
+                               download_covers, meta, ext, logfn,
+                               remover_acentos_flag, limpar_caracteres_flag):
+    """Processa metadados bem-sucedidos"""
+    logfn("=== METADADOS CONFIRMADOS ===", "success")
+    
+    # Aplicar normalizações
     meta = apply_text_normalization(meta, remover_acentos_flag, limpar_caracteres_flag)
-
+    
     # Log detalhado
-    logfn("=== METADADOS CONFIRMADOS PELA API ===", "success")
-    logfn(f"Título: {meta.get('title', 'Nenhum')}", "info")
-    logfn(f"Autores: {', '.join(meta.get('authors', ['Nenhum']))}", "info")
-    logfn(f"Ano: {meta.get('publishedDate', 'Nenhum')}", "info")
-    logfn(f"Gêneros: {', '.join(meta.get('categories', ['Nenhum']))}", "info")
-    logfn(f"Fonte: {fonte}", "info")
+    for key in ['title', 'authors', 'publishedDate', 'categories']:
+        value = meta.get(key, 'Nenhum')
+        if key == 'authors' and value != 'Nenhum':
+            value = ', '.join(value)
+        logfn(f"{key.capitalize()}: {value}", "info")
+    
+    logfn(f"Fonte: {meta.get('fonte', 'Desconhecida')}", "info")
     logfn("============================", "info")
-
+    
     # Determinar destino
     author = choose_primary_author(meta.get('authors')) if meta.get('authors') else "Autor Desconhecido"
     genre = choose_primary_genre(meta.get('categories')) if meta.get('categories') else "Geral"
     year = year_from_date_str(meta.get('publishedDate')) or "s.d."
-    title = meta.get('title') or os.path.splitext(filename)[0]
-
-    if organize_mode == 'autor':
-        dest_dir = os.path.join(out_base, sanitize_filename(author))
-        logfn(f"Organizando por autor: {author}", "info")
-    else:
-        dest_dir = os.path.join(out_base, sanitize_filename(genre), sanitize_filename(author))
-        logfn(f"Organizando por gênero/autor: {genre}/{author}", "info")
-
-    os.makedirs(dest_dir, exist_ok=True)
-
+    title = meta.get('title') or os.path.splitext(os.path.basename(path))[0]
+    
+    # Criar diretório de destino
+    dest_dir = create_destination_dir(out_base, organize_mode, author, genre, logfn)
+    
+    # Construir nome do arquivo
     dest_name = build_filename({
         'authors': [author],
         'title': title,
@@ -1738,33 +2298,13 @@ def process_file(path: str,
     
     dest_path = ensure_unique_path(dest_dir, dest_name)
     logfn(f"Destino: {os.path.relpath(dest_path, out_base)}", "info")
-
-    # Baixar capa
-    cover_path = ""
-    if download_covers and has_sufficient_metadata:
-        config = load_config()
-        covers_dir = get_config_value(config, 'Geral', 'covers_dirname', 'covers')
-        covers_full_dir = os.path.join(dest_dir, covers_dir)
-        base_cover_name = os.path.splitext(os.path.basename(dest_path))[0]
-        
-        if meta.get('imageLinks'):
-            cp = download_cover(meta.get('imageLinks'), covers_full_dir, base_cover_name, logfn, fonte)
-            cover_path = cp or ""
-
+    
+    # Baixar capa se necessário
+    cover_path = download_cover_if_needed(download_covers, meta, dest_dir, dest_name, logfn)
+    
     # Mover arquivo
-    try:
-        shutil.move(path, dest_path)
-        status = 'moved'
-        note = f'Fonte: {fonte}'
-        if isbn:
-            note += f', ISBN: {isbn}'
-        logfn(f"✅ SUCESSO: Movido para {os.path.relpath(dest_path, out_base)}", "success")
-    except Exception as e:
-        status = 'error'
-        note = f"Erro: {str(e)}"
-        logfn(f"❌ ERRO: Falha ao mover arquivo: {e}", "error")
-        dest_path = path
-
+    status, note = move_file(path, dest_path, meta.get('fonte', 'Desconhecida'), meta.get('isbn'), logfn)
+    
     return ActionLog(
         source_path=path,
         dest_path=dest_path,
@@ -1775,9 +2315,707 @@ def process_file(path: str,
         cover_path=cover_path,
         status=status,
         note=note,
-        fonte=fonte
+        fonte=meta.get('fonte', 'Desconhecida')
     )
+
+def create_destination_dir(out_base, organize_mode, author, genre, logfn):
+    """Cria diretório de destino baseado no modo de organização"""
+    if organize_mode == 'autor':
+        dest_dir = os.path.join(out_base, sanitize_filename(author))
+        logfn(f"Organizando por autor: {author}", "info")
+    else:
+        dest_dir = os.path.join(out_base, sanitize_filename(genre), sanitize_filename(author))
+        logfn(f"Organizando por gênero/autor: {genre}/{author}", "info")
     
+    os.makedirs(dest_dir, exist_ok=True)
+    return dest_dir
+
+def download_cover_if_needed(download_covers, meta, dest_dir, dest_name, logfn):
+    """Baixa capa se necessário e configurado"""
+    if not download_covers or not meta.get('imageLinks'):
+        return ""
+    
+    config = load_config()
+    covers_dir = get_config_value(config, 'Geral', 'covers_dirname', 'covers')
+    covers_full_dir = os.path.join(dest_dir, covers_dir)
+    base_cover_name = os.path.splitext(os.path.basename(dest_name))[0]
+    
+    return download_cover(meta.get('imageLinks'), covers_full_dir, base_cover_name, logfn, meta.get('fonte', '')) or ""
+
+def move_file(src_path, dest_path, fonte, isbn, logfn):
+    """Move o arquivo com tratamento de erro"""
+    try:
+        shutil.move(src_path, dest_path)
+        note = f'Fonte: {fonte}'
+        if isbn:
+            note += f', ISBN: {isbn}'
+        logfn(f"✅ SUCESSO: Movido para {os.path.relpath(dest_path, os.path.dirname(dest_path))}", "success")
+        return 'moved', note
+    except Exception as e:
+        logfn(f"❌ ERRO: Falha ao mover arquivo: {e}", "error")
+        return 'error', f"Erro: {str(e)}"
+
+def move_to_unknown(path, out_base, filename, logfn):
+    """Move arquivo para pasta de não localizados"""
+    logfn("=== RESULTADO: Nenhum resultado válido encontrado ===", "warning")
+    
+    config = load_config()
+    unknown_dir = get_config_value(config, 'Geral', 'unknown_dirname', '2. Não Localizados')
+    dest_dir = os.path.join(out_base, unknown_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    
+    clean_name = normalize_unknown_filename(filename)
+    dest_path = os.path.join(dest_dir, clean_name)
+    
+    try:
+        shutil.move(path, dest_path)
+        logfn(f"✗ Movido para: {unknown_dir}/{clean_name}", "warning")
+        
+        return ActionLog(
+            source_path=path,
+            dest_path=dest_path,
+            title=os.path.splitext(filename)[0],
+            author="Desconhecido",
+            year="s.d.",
+            genre="Não Localizado",
+            cover_path="",
+            status="moved_to_unknown",
+            note="Nenhum metadado válido encontrado",
+            fonte="Sistema"
+        )
+    except Exception as e:
+        logfn(f"ERRO: Falha ao mover para não localizados: {e}", "error")
+        return ActionLog(
+            source_path=path,
+            dest_path=path,
+            title=os.path.splitext(filename)[0],
+            author="Desconhecido",
+            year="s.d.",
+            genre="Erro",
+            cover_path="",
+            status="error",
+            note=str(e),
+            fonte="Erro"
+        )
+
+
+class GerenciadorNaoLocalizados(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Gerenciador de Arquivos Não Localizados")
+        self.geometry("1400x800")
+        self.parent = parent
+        
+        # Carregar configuração
+        self.config = load_config()
+        self.unknown_dir = get_config_value(self.config, 'Geral', 'unknown_dirname', '2. Não Localizados')
+        self.base_dir = get_config_value(self.config, 'Pastas', 'pasta_destino', '')
+        self.deleted_dir = get_config_value(self.config, 'Geral', 'deleted_dirname', '4. Excluidos')
+        
+        self.arquivos = []
+        self.dados_editados = {}
+        
+        self.create_widgets()
+        # Carregar após um delay para não travar a interface
+        self.after(100, self.carregar_arquivos)
+    
+    def create_widgets(self):
+        """Cria os widgets da interface"""
+        # Frame principal
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Indicador de carregamento (inicialmente visível)
+        self.loading_label = ttk.Label(main_frame, text="🔄 Carregando arquivos...", font=('Arial', 12))
+        self.loading_label.grid(row=0, column=0, columnspan=5, pady=10)
+        
+        # Contador de arquivos (inicialmente escondido)
+        self.contador_var = tk.StringVar(value="Carregando...")
+        self.contador_label = ttk.Label(main_frame, textvariable=self.contador_var, font=('Arial', 10, 'bold'))
+        
+        # Treeview para listar arquivos (editável) - inicialmente escondido
+        columns = ('arquivo', 'titulo', 'autor', 'ano', 'extensao')
+        self.tree = ttk.Treeview(main_frame, columns=columns, show='headings', height=20)
+        
+        # Configurar colunas
+        self.tree.heading('arquivo', text='Arquivo')
+        self.tree.heading('titulo', text='Título do Livro')
+        self.tree.heading('autor', text='Autor')
+        self.tree.heading('ano', text='Ano')
+        self.tree.heading('extensao', text='Ext.')
+        
+        self.tree.column('arquivo', width=250)
+        self.tree.column('titulo', width=350, stretch=True)
+        self.tree.column('autor', width=250, stretch=True)
+        self.tree.column('ano', width=30)
+        self.tree.column('extensao', width=10)
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(main_frame, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Frame para botões (2 linhas) - inicialmente escondido
+        self.button_frame1 = ttk.Frame(main_frame)
+        self.button_frame2 = ttk.Frame(main_frame)
+        
+        # Botões da primeira linha
+        ttk.Button(self.button_frame1, text="↻ Recarregar", command=self.recarregar_arquivos).pack(side='left', padx=2)
+        ttk.Button(self.button_frame1, text="📝 Extrair Metadados", command=self.extrair_metadados_todos).pack(side='left', padx=2)
+        ttk.Button(self.button_frame1, text="🔍 Consultar API", command=self.consultar_api_selecionados).pack(side='left', padx=2)
+        ttk.Button(self.button_frame1, text="✅ Processar", command=self.processar_selecionados).pack(side='left', padx=2)
+        ttk.Button(self.button_frame1, text="🚀 Processar Todos", command=self.processar_todos).pack(side='left', padx=2)
+        
+        # Botões da segunda linha (com destaque para excluir)
+        ttk.Button(self.button_frame2, text="📊 Estatísticas", command=self.mostrar_estatisticas).pack(side='left', padx=2)
+        ttk.Button(self.button_frame2, text="🗑️ Excluir Selecionados", command=self.excluir_selecionados, style='Danger.TButton').pack(side='left', padx=2)
+        ttk.Button(self.button_frame2, text="❌ Fechar", command=self.destroy).pack(side='right', padx=2)
+        
+        # Configurar estilo para botão de excluir
+        style = ttk.Style()
+        style.configure('Danger.TButton', foreground='black', background='#8B0000')
+        
+        # Configurar expansão
+        main_frame.grid_rowconfigure(1, weight=1)
+        main_frame.grid_columnconfigure(0, weight=1)
+        
+        # Bind events
+        self.tree.bind('<Double-1>', self.abrir_arquivo)
+        self.tree.bind('<ButtonRelease-1>', self.on_clique)
+        self.tree.bind('<Key>', self.on_tecla)
+        self.tree.bind("<Delete>", lambda event: self.excluir_selecionados())
+        
+        # Variáveis para edição
+        self.editing_item = None
+        self.editing_column = None
+        
+        # Tooltip para instruções (inicialmente escondido)
+        self.tooltip_text = "Dica: Clique duplo para abrir arquivo | Clique em uma célula para editar | Enter para confirmar | Delete para limpar"
+        self.tooltip = ttk.Label(main_frame, text=self.tooltip_text, font=('Arial', 9), foreground='gray')
+    
+    def carregar_arquivos(self):
+        """Carrega os arquivos da pasta não localizados com proteção"""
+        try:
+            unknown_path = os.path.join(self.base_dir, self.unknown_dir)
+            if not os.path.exists(unknown_path):
+                self.loading_label.config(text="❌ Pasta não localizados não existe")
+                self.arquivos = []
+                return
+            
+            self.arquivos = []
+            arquivos = os.listdir(unknown_path)
+            
+            if not arquivos:
+                self.loading_label.config(text="✅ Pasta vazia - Nenhum arquivo não localizado")
+                return
+            
+            self.loading_label.config(text=f"🔄 Carregando {len(arquivos)} arquivos...")
+            self.update()  # Atualizar a interface
+            
+            for i, filename in enumerate(arquivos):
+                filepath = os.path.join(unknown_path, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        # Extrair metadados do nome do arquivo
+                        nome_sem_ext = os.path.splitext(filename)[0]
+                        metadados = extract_metadata_from_filename(filename)  # AQUI chama a função correta
+                        
+                        # Garantir que os valores não sejam None
+                        titulo = metadados.get('title', nome_sem_ext) or nome_sem_ext
+                        autores = metadados.get('authors', [])
+                        autor = ', '.join(autores) if autores else "Desconhecido"
+                        ano = metadados.get('publishedDate', 's.d.') or 's.d.'
+                        
+                        self.arquivos.append({
+                            'filename': filename,
+                            'full_path': filepath,
+                            'titulo': titulo,
+                            'autor': autor,
+                            'ano': ano,
+                            'extensao': os.path.splitext(filename)[1].lower()
+                        })
+                    except Exception as e:
+                        print(f"Erro ao processar {filename}: {e}")
+                        continue
+            
+            # Esconder loading e mostrar interface principal
+            self.loading_label.grid_remove()
+            self.mostrar_interface_principal()
+            
+        except Exception as e:
+            self.loading_label.config(text=f"❌ Erro ao carregar: {str(e)}")
+            messagebox.showerror("Erro", f"Erro ao carregar arquivos: {e}")    
+
+    def mostrar_interface_principal(self):
+        """Mostra a interface principal após carregamento"""
+        # Mostrar contador
+        self.contador_label.grid(row=0, column=0, columnspan=5, sticky='w', pady=(0, 10))
+        
+        # Mostrar treeview
+        self.tree.grid(row=1, column=0, columnspan=4, sticky='nsew', padx=(0, 5))
+        
+        # Mostrar scrollbar
+        scrollbar = ttk.Scrollbar(self.tree.master, orient='vertical', command=self.tree.yview)
+        scrollbar.grid(row=1, column=4, sticky='ns')
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Mostrar botões
+        self.button_frame1.grid(row=2, column=0, columnspan=5, pady=(10, 5), sticky='ew')
+        self.button_frame2.grid(row=3, column=0, columnspan=5, pady=(0, 10), sticky='ew')
+        
+        # Mostrar tooltip
+        self.tooltip.grid(row=4, column=0, columnspan=5, pady=(5, 0), sticky='w')
+        
+        # Atualizar dados
+        self.atualizar_contador()
+        self.atualizar_lista()
+    
+    def recarregar_arquivos(self):
+        """Recarrega os arquivos mostrando indicador de loading"""
+        self.loading_label.grid()
+        self.contador_label.grid_remove()
+        self.tree.grid_remove()
+        self.button_frame1.grid_remove()
+        self.button_frame2.grid_remove()
+        self.tooltip.grid_remove()
+        
+        self.loading_label.config(text="🔄 Recarregando...")
+        self.after(100, self.carregar_arquivos)
+    
+    def atualizar_contador(self):
+        """Atualiza o contador de arquivos"""
+        total = len(self.arquivos)
+        editados = len(self.dados_editados)
+        self.contador_var.set(f"📊 {total} arquivo(s) | ✏️ {editados} editado(s) | ✅ {total - editados} original(is)")
+    
+    def atualizar_lista(self):
+        """Atualiza a lista de arquivos na treeview"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        for arquivo in self.arquivos:
+            # Usar dados editados se existirem
+            if arquivo['filename'] in self.dados_editados:
+                dados = self.dados_editados[arquivo['filename']]
+                self.tree.insert('', 'end', values=(
+                    arquivo['filename'],
+                    dados.get('titulo', arquivo['titulo']),
+                    dados.get('autor', arquivo['autor']),
+                    dados.get('ano', arquivo['ano']),
+                    arquivo['extensao']
+                ), tags=('editado',))
+            else:
+                self.tree.insert('', 'end', values=(
+                    arquivo['filename'],
+                    arquivo['titulo'],
+                    arquivo['autor'],
+                    arquivo['ano'],
+                    arquivo['extensao']
+                ))
+        
+        # Configurar tags para estilo
+        self.tree.tag_configure('editado', background='#f0f8ff')  # Azul claro para editados
+    
+    def excluir_selecionados(self):
+        """Move os arquivos selecionados para a pasta de excluídos"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo para excluir")
+            return
+        
+        # Criar pasta de excluídos se não existir
+        deleted_path = os.path.join(self.base_dir, self.deleted_dir)
+        os.makedirs(deleted_path, exist_ok=True)
+        
+        arquivos_excluir = []
+        for item_id in selection:
+            item = self.tree.item(item_id)
+            filename = item['values'][0]
+            arquivos_excluir.append(filename)
+        
+        #REMOVENDO NECESSIDADE DE CONFIRMAÇÃO
+        #confirmacao = messagebox.askyesno(
+        #    "Confirmar Exclusão", 
+        #    f"Deseja mover {len(arquivos_excluir)} arquivo(s) para a pasta de excluídos?\n\n"
+        #    f"Os arquivos serão movidos para: {self.deleted_dir}"
+        #)
+        #
+        #if not confirmacao:
+        #    return
+        
+        success_count = 0
+        error_count = 0
+        
+        for filename in arquivos_excluir:
+            try:
+                # Encontrar arquivo
+                for arquivo in self.arquivos[:]:  # Usar cópia para remover durante iteração
+                    if arquivo['filename'] == filename:
+                        src_path = arquivo['full_path']
+                        dest_path = os.path.join(deleted_path, filename)
+                        
+                        # Mover para pasta de excluídos
+                        shutil.move(src_path, dest_path)
+                        
+                        # Remover da lista
+                        self.arquivos.remove(arquivo)
+                        if filename in self.dados_editados:
+                            del self.dados_editados[filename]
+                        
+                        success_count += 1
+                        break
+            except Exception as e:
+                print(f"Erro ao excluir {filename}: {e}")
+                error_count += 1
+        
+        # Atualizar interface
+        self.atualizar_lista()
+        self.atualizar_contador()
+        
+        #REMOVENDO MENSAGEM DE SUCESSO/ERRO
+        #messagebox.showinfo(
+        #    "Exclusão Concluída",
+        #    f"Arquivos movidos para excluídos:\n"
+        #    f"✅ Sucesso: {success_count}\n"
+        #    f"❌ Erros: {error_count}"
+        #)
+    
+    
+    def on_clique(self, event):
+        """Quando clica em uma célula para editar"""
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            column = self.tree.identify_column(event.x)
+            item = self.tree.identify_row(event.y)
+            
+            if item and column != '#1':  # Não editar coluna do arquivo
+                self.iniciar_edicao(item, column)
+    
+    def iniciar_edicao(self, item, column):
+        """Inicia a edição de uma célula"""
+        col_index = int(column[1:]) - 1
+        col_name = ['arquivo', 'titulo', 'autor', 'ano', 'extensao'][col_index]
+        
+        # Não editar nome do arquivo ou extensão
+        if col_name in ['arquivo', 'extensao']:
+            return
+        
+        self.editing_item = item
+        self.editing_column = col_index
+        
+        # Obter valor atual
+        current_values = list(self.tree.item(item, 'values'))
+        current_value = current_values[col_index] if col_index < len(current_values) else ""
+        
+        # Criar entry para edição
+        bbox = self.tree.bbox(item, column)
+        if not bbox:
+            return
+        
+        x, y, width, height = bbox
+        self.entry_edit = ttk.Entry(self.tree, font=('Arial', 9))
+        self.entry_edit.insert(0, current_value)
+        self.entry_edit.select_range(0, tk.END)
+        self.entry_edit.focus()
+        
+        self.entry_edit.place(x=x, y=y, width=width, height=height)
+        
+        # Bind events
+        self.entry_edit.bind('<Return>', self.finalizar_edicao)
+        self.entry_edit.bind('<Escape>', self.cancelar_edicao)
+        self.entry_edit.bind('<FocusOut>', self.finalizar_edicao)
+    
+    def finalizar_edicao(self, event=None):
+        """Finaliza a edição e salva o valor"""
+        if not self.editing_item or not self.editing_column:
+            return
+        
+        novo_valor = self.entry_edit.get().strip()
+        self.entry_edit.destroy()
+        
+        # Obter filename do item
+        values = list(self.tree.item(self.editing_item, 'values'))
+        filename = values[0]
+        
+        # Encontrar arquivo correspondente
+        for arquivo in self.arquivos:
+            if arquivo['filename'] == filename:
+                # Salvar dados editados
+                if filename not in self.dados_editados:
+                    self.dados_editados[filename] = {
+                        'titulo': arquivo['titulo'],
+                        'autor': arquivo['autor'],
+                        'ano': arquivo['ano']
+                    }
+                
+                # Atualizar valor editado
+                col_name = ['arquivo', 'titulo', 'autor', 'ano', 'extensao'][self.editing_column]
+                self.dados_editados[filename][col_name] = novo_valor
+                
+                # Atualizar lista
+                self.atualizar_lista()
+                self.atualizar_contador()
+                break
+        
+        self.editing_item = None
+        self.editing_column = None
+    
+    def cancelar_edicao(self, event=None):
+        """Cancela a edição"""
+        self.entry_edit.destroy()
+        self.editing_item = None
+        self.editing_column = None
+    
+    def on_tecla(self, event):
+        """Handle teclas para navegação rápida"""
+        if event.keysym == 'Delete' and self.tree.selection():
+            # Limpar campo quando pressionar Delete
+            selection = self.tree.selection()[0]
+            column = self.tree.identify_column(event.x)
+            if column != '#1':  # Não limpar nome do arquivo
+                self.iniciar_edicao(selection, column)
+                self.entry_edit.delete(0, tk.END)
+    
+    def abrir_arquivo(self, event):
+        """Abre o arquivo selecionado"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        filename = item['values'][0]
+        
+        # Encontrar o arquivo completo
+        for arquivo in self.arquivos:
+            if arquivo['filename'] == filename:
+                try:
+                    os.startfile(arquivo['full_path'])  # Windows
+                except:
+                    try:
+                        import subprocess
+                        subprocess.run(['xdg-open', arquivo['full_path']])  # Linux
+                    except:
+                        try:
+                            import subprocess
+                            subprocess.run(['open', arquivo['full_path']])  # macOS
+                        except:
+                            messagebox.showerror("Erro", "Não foi possível abrir o arquivo")
+                break
+    
+    def extrair_metadados_todos(self):
+        """Extrai metadados de todos os arquivos automaticamente"""
+        for arquivo in self.arquivos:
+            if arquivo['filename'] not in self.dados_editados:
+                metadados = extract_metadata_from_filename(arquivo['filename'])
+                if metadados.get('title') or metadados.get('authors'):
+                    self.dados_editados[arquivo['filename']] = {
+                        'titulo': metadados.get('title', arquivo['titulo']),
+                        'autor': ', '.join(metadados['authors']) if metadados.get('authors') else arquivo['autor'],
+                        'ano': metadados.get('publishedDate', arquivo['ano'])
+                    }
+        
+        self.atualizar_lista()
+        self.atualizar_contador()
+        messagebox.showinfo("Sucesso", "Metadados extraídos de todos os arquivos!")
+    
+    def consultar_api_selecionados(self):
+        """Consulta API para os arquivos selecionados"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo")
+            return
+        
+        api_key = get_config_value(self.config, 'API', 'google_books_key', '')
+        success_count = 0
+        
+        for item_id in selection:
+            item = self.tree.item(item_id)
+            filename = item['values'][0]
+            
+            # Encontrar arquivo
+            for arquivo in self.arquivos:
+                if arquivo['filename'] == filename:
+                    # Usar título atual (editado ou original) para pesquisa
+                    titulo_pesquisa = item['values'][1]  # Coluna do título
+                    
+                    # Consultar API
+                    resultado = buscar_metadados_inteligente(titulo_pesquisa, None, api_key)
+                    
+                    if resultado:
+                        # Atualizar dados
+                        if filename not in self.dados_editados:
+                            self.dados_editados[filename] = {
+                                'titulo': arquivo['titulo'],
+                                'autor': arquivo['autor'],
+                                'ano': arquivo['ano']
+                            }
+                        
+                        self.dados_editados[filename].update({
+                            'titulo': resultado.get('title', self.dados_editados[filename]['titulo']),
+                            'autor': ', '.join(resultado.get('authors', [self.dados_editados[filename]['autor']])),
+                            'ano': resultado.get('publishedDate', self.dados_editados[filename]['ano'])
+                        })
+                        success_count += 1
+                    break
+        
+        self.atualizar_lista()
+        self.atualizar_contador()
+        messagebox.showinfo("API", f"Consulta concluída: {success_count} de {len(selection)} arquivos encontrados")
+    
+    def processar_selecionados(self):
+        """Processa os arquivos selecionados"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo")
+            return
+        
+        arquivos_processar = []
+        for item_id in selection:
+            item = self.tree.item(item_id)
+            filename = item['values'][0]
+            if filename in self.dados_editados:
+                arquivos_processar.append((filename, self.dados_editados[filename]))
+        
+        self.processar_arquivos(arquivos_processar)
+    
+    def processar_todos(self):
+        """Processa todos os arquivos com dados editados"""
+        if not self.dados_editados:
+            messagebox.showwarning("Aviso", "Nenhum arquivo com dados editados para processar")
+            return
+        
+        self.processar_arquivos(list(self.dados_editados.items()))
+    
+    def processar_arquivos(self, arquivos):
+        """Processa os arquivos com os metadados editados"""
+        if not arquivos:
+            return
+            
+        success_count = 0
+        error_count = 0
+        
+        for filename, metadados in arquivos:
+            try:
+                # Encontrar o arquivo original
+                arquivo_info = None
+                for arquivo in self.arquivos:
+                    if arquivo['filename'] == filename:
+                        arquivo_info = arquivo
+                        break
+                
+                if not arquivo_info:
+                    continue
+                
+                # Preparar metadados para processamento
+                meta_para_processar = {
+                    'title': metadados['titulo'],
+                    'authors': [auth.strip() for auth in metadados['autor'].split(',')],
+                    'publishedDate': metadados['ano'],
+                    'fonte': 'Editor Manual'
+                }
+                
+                # Usar a função process_file simplificada
+                result = self.processar_arquivo_individual(
+                    arquivo_info['full_path'],
+                    meta_para_processar
+                )
+                
+                if result and result['status'] == 'success':
+                    success_count += 1
+                    # Remover da lista atual
+                    self.arquivos.remove(arquivo_info)
+                    if filename in self.dados_editados:
+                        del self.dados_editados[filename]
+                else:
+                    error_count += 1
+                    
+            except Exception as e:
+                print(f"Erro ao processar {filename}: {e}")
+                error_count += 1
+        
+        # Atualizar interface
+        self.atualizar_lista()
+        self.atualizar_contador()
+        
+        messagebox.showinfo(
+            "Processamento Concluído",
+            f"Arquivos processados:\n"
+            f"✅ Sucesso: {success_count}\n"
+            f"❌ Erros: {error_count}"
+        )
+
+    def processar_arquivo_individual(self, filepath, metadata):
+        """Processa um arquivo individual com metadados pré-definidos"""
+        try:
+            config = load_config()
+            out_base = self.base_dir
+            organize_mode = get_config_value(config, 'Geral', 'organize_mode', 'autor')
+            pattern = get_config_value(config, 'Geral', 'filename_pattern', '{author} - {title} ({year})')
+            download_covers = get_config_value(config, 'Opcoes', 'baixar_capas', 'True').lower() == 'true'
+            remover_acentos = get_config_value(config, 'Opcoes', 'remover_acentos', 'True').lower() == 'true'
+            limpar_caracteres = get_config_value(config, 'Opcoes', 'limpar_caracteres', 'True').lower() == 'true'
+            
+            # Aplicar normalizações
+            meta = apply_text_normalization(metadata, remover_acentos, limpar_caracteres)
+            
+            # Determinar destino
+            author = choose_primary_author(meta.get('authors')) if meta.get('authors') else "Autor Desconhecido"
+            genre = choose_primary_genre(meta.get('categories')) if meta.get('categories') else "Geral"
+            year = year_from_date_str(meta.get('publishedDate')) or "s.d."
+            title = meta.get('title') or os.path.splitext(os.path.basename(filepath))[0]
+            ext = os.path.splitext(filepath)[1].lower()
+            
+            # Criar diretório de destino
+            if organize_mode == 'autor':
+                dest_dir = os.path.join(out_base, sanitize_filename(author))
+            else:
+                dest_dir = os.path.join(out_base, sanitize_filename(genre), sanitize_filename(author))
+            
+            os.makedirs(dest_dir, exist_ok=True)
+            
+            # Construir nome do arquivo
+            dest_name = build_filename({
+                'authors': [author],
+                'title': title,
+                'publishedDate': year
+            }, ext, pattern=pattern)
+            
+            dest_path = ensure_unique_path(dest_dir, dest_name)
+            
+            # Mover arquivo
+            shutil.move(filepath, dest_path)
+            
+            return {'status': 'success', 'path': dest_path}
+            
+        except Exception as e:
+            print(f"Erro no processamento individual: {e}")
+            return {'status': 'error', 'error': str(e)}
+    
+    def mostrar_estatisticas(self):
+        """Mostra estatísticas detalhadas"""
+        total = len(self.arquivos)
+        editados = len(self.dados_editados)
+        extensoes = {}
+        
+        for arquivo in self.arquivos:
+            ext = arquivo['extensao']
+            extensoes[ext] = extensoes.get(ext, 0) + 1
+        
+        stats_text = f"""📊 ESTATÍSTICAS DETALHADAS
+
+• Arquivos totais: {total}
+• Arquivos editados: {editados}
+• Arquivos originais: {total - editados}
+
+📁 Extensões:
+"""
+        for ext, count in extensoes.items():
+            stats_text += f"   {ext}: {count} arquivo(s)\n"
+        
+        stats_text += f"\n💾 Dados editados: {len(self.dados_editados)} arquivo(s)"
+        
+        messagebox.showinfo("Estatísticas Detalhadas", stats_text)
+
+
 # === Interface Tkinter ===
 class App(tk.Tk):
     def __init__(self):
@@ -1799,6 +3037,12 @@ class App(tk.Tk):
         self.remover_acentos_var = tk.BooleanVar(value=get_config_value(self.config, 'Opcoes', 'remover_acentos', 'True').lower() == 'true')
         self.limpar_caracteres_var = tk.BooleanVar(value=get_config_value(self.config, 'Opcoes', 'limpar_caracteres', 'True').lower() == 'true')
         self.ignorar_sem_meta_var = tk.BooleanVar(value=get_config_value(self.config, 'Opcoes', 'ignorar_sem_metadados', 'False').lower() == 'true')
+        
+        # No __init__ da classe App
+        self.isbndb_key_var = tk.StringVar(value=get_config_value(self.config, 'API', 'isbndb_key', ''))
+        self.google_cse_key_var = tk.StringVar(value=get_config_value(self.config, 'API', 'google_cse_key', ''))
+        self.google_cse_id_var = tk.StringVar(value=get_config_value(self.config, 'API', 'google_cse_id', ''))
+
 
         self.queue = queue.Queue()
         self.stop_flag = threading.Event()
@@ -1808,7 +3052,7 @@ class App(tk.Tk):
         self.create_widgets()
         
         # Chamar teste de APIs após um pequeno delay para garantir que a interface esteja pronta
-        self.after(100, self.test_apis)
+        #self.after(100, self.test_apis)
     
     def create_widgets(self):
         pad = {'padx': 8, 'pady': 6}
@@ -1870,6 +3114,7 @@ class App(tk.Tk):
         row8 = ttk.Frame(frm)
         row8.pack(fill='x', **pad)
         ttk.Button(row8, text="Não Localizados", command=self.show_unknown_files).pack(side='left')
+        ttk.Button(row8, text="Estatísticas", command=self.show_stats).pack(side='left', padx=5)
 
         # Barra de progresso
         self.progress = ttk.Progressbar(frm, orient='horizontal', mode='determinate')
@@ -1994,12 +3239,27 @@ class App(tk.Tk):
             self.dst_var.set(d)
     
     def show_unknown_files(self):
-        """Mostra mensagem para função não implementada"""
-        messagebox.showinfo("Não Localizados", 
-                           "Função ainda não implementada.\n\n"
-                           "Esta funcionalidade permitirá gerenciar os arquivos "
-                           "que não foram identificados automaticamente.")
+        """Abre o gerenciador de não localizados"""
+        if not self.dst_var.get():
+            messagebox.showerror("Erro", "Configure a pasta destino primeiro")
+            return
+        
+        GerenciadorNaoLocalizados(self)
     
+    def show_stats(self):
+        """Mostra estatísticas"""
+        try:
+            unknown_dir = get_config_value(self.config, 'Geral', 'unknown_dirname', '2. Não Localizados')
+            unknown_path = os.path.join(self.dst_var.get(), unknown_dir)
+            
+            if os.path.exists(unknown_path):
+                count = len([f for f in os.listdir(unknown_path) if os.path.isfile(os.path.join(unknown_path, f))])
+                messagebox.showinfo("Estatísticas", f"Arquivos não localizados: {count}")
+            else:
+                messagebox.showinfo("Estatísticas", "Pasta de não localizados não existe")
+                
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao ler estatísticas: {e}")    
     def start_processing(self):
         src = self.src_var.get().strip()
         dst = self.dst_var.get().strip()
