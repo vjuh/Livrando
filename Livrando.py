@@ -31,7 +31,6 @@ Observações:
 - Metadados de gênero/categoria são mais consistentes na Google Books; a Open Library serve como fallback.
 - Para MOBI/AZW3, o script usa heurística (nome do arquivo + APIs), pois ler metadados nativos desses formatos não é trivial sem libs específicas.
 
-Autor: ChatGPT (GPT-5 Thinking)
 """
 
 import os
