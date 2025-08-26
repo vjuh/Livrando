@@ -1,5 +1,5 @@
 # Livrando - Organizador Automático de Livros
-============
+
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg)
@@ -7,7 +7,6 @@
 Organizador inteligente de livros digitais que automaticamente extrai metadados, renomeia arquivos e organiza em pastas por autor ou gênero.
 
 ## ✨ Funcionalidades
-============
 
 - 📚 Suporte a múltiplos formatos: EPUB, PDF, MOBI, AZW3, DJVU, DOCX, etc.
 - 🔍 Extração inteligente de metadados de arquivos e APIs
@@ -20,7 +19,6 @@ Organizador inteligente de livros digitais que automaticamente extrai metadados,
 - ⚡ Processamento em lote com barra de progresso
 
 ## 🚀 Instalação
-============
 
 ### Pré-requisitos
 - Python 3.8 ou superior
@@ -66,7 +64,7 @@ pip install -r requirements.txt
 
 ```
 ## 📖 Como usar
-============
+
 1. Execute o programa:
 
 ```bash
@@ -92,7 +90,7 @@ python Livrando.py
 	- Processe novamente os arquivos editados
 
 ## Comandos para testar:
-============
+
 ```bash
 # Navegue até a pasta do projeto
 cd livrando
@@ -111,7 +109,7 @@ python test_install.py
 ```
 
 ## ⚙️ Configuração da API
-============
+
 Para melhores resultados, obtenha uma chave da Google Books API:
 
 1. Acesse Google Cloud Console
@@ -120,7 +118,6 @@ Para melhores resultados, obtenha uma chave da Google Books API:
 4. Cole a chave no campo apropriado no programa
 
 ## 📁 Estrutura de pastas resultante
-============
 
 ``` text
 biblioteca_organizada/
@@ -142,7 +139,7 @@ biblioteca_organizada/
     └── Autor 4/
 ```
 ## 🛠️ Desenvolvimento
-============
+
 - Estrutura do projeto
 
 ``` text
@@ -163,17 +160,17 @@ livrando/
 ``` 
 
 ## 📝 Licença
-============
+
 Este projeto está sob a licença MIT. Veja o arquivo LICENSE para detalhes.
 
 ## 🤝 Suporte
-============
+
 Encontrou um problema ou tem uma sugestão?
 
 - Entre em contato pelo email: seu-email@exemplo.com
 
 ## 🙏 Agradecimentos
-============
+
 - Google Books API por fornecer metadados de livros
 - Open Library por ser uma fonte alternativa aberta
 - Comunidade Python por todas as bibliotecas incríveis
